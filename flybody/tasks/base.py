@@ -1,6 +1,3 @@
-"""Base classes for fruitfly tasks."""
-# ruff: noqa: F821
-
 from typing import Callable, Union, Sequence
 from abc import ABC, abstractmethod
 import numpy as np
@@ -9,14 +6,14 @@ from dm_control import composer
 from dm_control import mjcf
 from dm_control.composer.observation import observable
 
+from flybody.tasks.constants import (
+    _FLY_PHYSICS_TIMESTEP, _FLY_CONTROL_TIMESTEP,
+    _WALK_PHYSICS_TIMESTEP, _WALK_CONTROL_TIMESTEP,
+    _BODY_PITCH_ANGLE, _TERMINAL_QACC, _WING_PARAMS
+)
 from flybody.quaternions import get_dquat_local
 from flybody.tasks.task_utils import make_ghost_fly
 from flybody.utils import any_substr_in_str
-from flybody.tasks.constants import (_FLY_PHYSICS_TIMESTEP,
-                                     _FLY_CONTROL_TIMESTEP, _BODY_PITCH_ANGLE,
-                                     _WALK_PHYSICS_TIMESTEP,
-                                     _WALK_CONTROL_TIMESTEP, _TERMINAL_QACC,
-                                     _WING_PARAMS)
 
 
 class FruitFlyTask(composer.Task, ABC):
@@ -43,7 +40,7 @@ class FruitFlyTask(composer.Task, ABC):
         ghost_offset: Sequence = np.array([0, 0, 0]),
         num_user_actions: int = 0,
         eye_camera_fovy: float = 150.,
-        eye_camera_size: int = 32,
+        eye_camera_size: int = (32, 32),
         future_steps: int = 0,
         initialize_qvel: bool = False,
         observables_options: dict | None = None,
@@ -121,7 +118,13 @@ class FruitFlyTask(composer.Task, ABC):
                               eye_camera_fovy=eye_camera_fovy,
                               eye_camera_size=eye_camera_size)
         # Set options to fly observables, if provided.
+
         self._walker.observables.set_options(observables_options)
+        if hasattr(arena, 'get_olfaction') and hasattr(arena, 'odor_names'):
+            self._walker.configure_olfaction(
+                callback=arena.get_olfaction,
+                odor_dimension_names=arena.odor_names,
+            )
 
         # Add it to the arena.
         spawn_pos = self._walker.upright_pose.xpos
@@ -170,6 +173,8 @@ class FruitFlyTask(composer.Task, ABC):
         for sensor in (self._walker.observables.vestibular +
                        self._walker.observables.proprioception):
             sensor.enabled = True
+        if hasattr(self._arena, 'get_olfaction'):
+            self._walker.observables.odor_intensity.enabled = True
 
     def initialize_episode_mjcf(self, random_state: np.random.RandomState):
         if hasattr(self._arena, 'regenerate'):
@@ -190,12 +195,16 @@ class FruitFlyTask(composer.Task, ABC):
     def initialize_episode(self, physics, random_state):
         # Reset control timestep counter.
         self._step_counter = 0
+        if hasattr(self._arena, 'reset_olfaction'):
+            self._arena.reset_olfaction(random_state)
 
     def before_step(self, physics: 'mjcf.Physics', action,
                     random_state: np.random.RandomState):
         """Apply actions."""
         self._step_counter += 1
         self._walker.apply_action(physics, action, random_state)
+        if hasattr(self._arena, 'advance_plume'):
+            self._arena.advance_plume()
 
     def should_terminate_episode(self, physics: 'mjcf.Physics'):
         return self._should_terminate
@@ -276,6 +285,7 @@ class Flying(FruitFlyTask):
         fluidcoef=_WING_PARAMS['fluidcoef'],
         floor_contacts: bool = False,
         disable_legs: bool = True,
+        eye_camera_size: int = (32, 32),
         **kwargs,
     ):
         """Base class for setting fly model configuration for flight tasks.
@@ -296,6 +306,7 @@ class Flying(FruitFlyTask):
                          use_antennae=False,
                          physics_timestep=_FLY_PHYSICS_TIMESTEP,
                          control_timestep=_FLY_CONTROL_TIMESTEP,
+                         eye_camera_size=eye_camera_size,
                          **kwargs)
 
         self._up_dir = self._walker.mjcf_model.find('site',
@@ -335,11 +346,11 @@ class Flying(FruitFlyTask):
         # Exclude wing-leg collisions.
         contact = self._walker.mjcf_model.contact
         for body in self._walker.mjcf_model.find_all('body'):
-            if any_substr_in_str(['coxa', 'femur', 'tibia', 'tarsus', 'claw'], 
+            if any_substr_in_str(['coxa', 'femur', 'tibia', 'tarsus', 'claw'],
                                  body.name):
                 for wing in ['wing_left', 'wing_right']:
-                    contact.add('exclude', 
-                                name=f'{body.name}_{wing}', 
+                    contact.add('exclude',
+                                name=f'{body.name}_{wing}',
                                 body1=body.name, body2=wing)
 
         # Get springref angles for retracted leg position.

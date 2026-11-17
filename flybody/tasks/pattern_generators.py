@@ -61,7 +61,7 @@ class WingBeatPatternGenerator():
             # Load base pattern for WBPG, shape (timesteps, 3).
             with open(base_pattern_path, 'rb') as f:
                 base_pattern = np.load(f)
-        base_pattern = np.tile(base_pattern, (1, 2))  # Duplicate for two wings.
+        base_pattern = np.tile(base_pattern, (1, 2))  # Duplicate for two wings. # shape (500,6)
 
         self.base_beat_freq = base_beat_freq
         self.rel_freq_range = rel_freq_range
@@ -205,3 +205,8 @@ class WingBeatPatternGenerator():
     def get_last_angles(self):
         """Re-return the last wing angles, could be used for debugging."""
         return self._traj[self._step, :]
+
+
+if __name__ == '__main__':
+    wpg_pattern_path = '/home/xw/flybody/dataset/datasets_flight-imitation/wing_pattern_fmech.npy'
+    wpg = WingBeatPatternGenerator(base_pattern_path=wpg_pattern_path)

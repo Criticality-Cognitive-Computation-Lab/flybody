@@ -174,7 +174,7 @@ class Hills(composer.Arena):
             size=size + (hfield_elevation_z, hfield_base_z))
 
         if aesthetic != 'default':
-          
+
             ground_info = locomotion_arenas_assets.get_ground_texture_info(
                 aesthetic)
             sky_info = locomotion_arenas_assets.get_sky_texture_info(aesthetic)
@@ -308,22 +308,33 @@ class SineTrench(Hills):
         sigma_range: Range of terrain smoothing stddev.
     """
 
-    def _build(self,
-               name='sine_trench',
-               dim=20,
-               aesthetic='outdoor_natural',
-               hfield_elevation_z=1,
-               hfield_base_z=0.05,
-               grid_density=10,
-               elevation_z_range=(4., 5.),
-               start_offset_range=(-5., -3.),
-               trench_len_range=(4., 10.),
-               phase_range=(0., 2 * np.pi),
-               wavelength_range=(5., 8.),
-               amplitude_range=(0.7 / 2, 1.2 / 2),
-               width_range=(0.5, 1),
-               height_range=(1.3, 1.3),
-               sigma_range=(0.2, 0.2)):
+    def _build(
+            self,
+            name='sine_trench',
+            dim=20,
+            aesthetic='outdoor_natural',
+            hfield_elevation_z=1,
+            hfield_base_z=0.05,
+            grid_density=10,
+            elevation_z_range=(4.5, 4.5),
+           start_offset_range=(-4., -4.),
+           trench_len_range=(8., 8.),
+           phase_range=(0., 0.),
+           wavelength_range=(6., 6.),
+           amplitude_range=(0.5, 0.5),
+           width_range=(0.7, 0.7),
+           height_range=(1.3, 1.3),
+           sigma_range=(0.2, 0.2)
+            # elevation_z_range=(4., 5.),
+            # start_offset_range=(-5., -3.),
+            # trench_len_range=(4., 10.),
+            # phase_range=(0., 2 * np.pi),
+            # wavelength_range=(5., 8.),
+            # amplitude_range=(0.7 / 2, 1.2 / 2),
+            # width_range=(0.5, 1),
+            # height_range=(1.3, 1.3),
+            # sigma_range=(0.2, 0.2)
+        ):
 
         super()._build(dim=dim,
                        aesthetic=aesthetic,

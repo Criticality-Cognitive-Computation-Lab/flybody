@@ -144,3 +144,17 @@ See our accompanying [publication][paper]. Thank you for your interest in our fl
   year = {2024},
 }
 ```
+
+## Lab environment branch
+
+`dev_fly_env` carries the environment formerly under `fly_unnamed/env` in
+`Criticality-Cognitive-Computation-Lab/017_fruit_fly`, dev revision `7491d163`.
+Its content-matched upstream base is `0cf9ffe2b51eddbec4da1943d0531af593d86800`;
+the original vendoring checkout hash was not recorded. All 85 OBJ meshes match
+that upstream base. The existing walker, sensory/task extensions and custom
+camera are retained, with imports and resource paths adapted to this package.
+Retina preprocessing comes from the matching FlyGym fork (`dev_fly_env`).
+Dataset paths and CPG mapper checkpoints must be supplied explicitly. The CPG
+here is the existing dev CSV/MLP controller; the newer recorded-template CPG has
+not been integrated. See the parent repository's environment migration report
+for before/after physics and sensory verification.

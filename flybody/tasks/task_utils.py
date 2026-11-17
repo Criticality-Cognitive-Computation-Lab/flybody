@@ -2,9 +2,10 @@
 # ruff: noqa: F821
 
 from collections import OrderedDict
-from typing import Sequence, Callable, Any
+from typing import Mapping, Sequence, Callable, Any
 
 import numpy as np
+import torch
 
 from flybody.quaternions import rotate_vec_with_quat
 
@@ -25,6 +26,36 @@ def observable_indices_in_tensor(
     return sorted_obs_dict
 
 
+def wing_qpos_to_conventional(model_wing_qpos: np.ndarray,
+                              body_pitch_angle: float = 47.5,
+                             ) -> np.ndarray:
+    """Transform model wing joint qpos to conventional wing kinematics definition.
+
+    Args:
+        model_wing_qpos: Wing MjData.qpos in radians, shape (B, 6).
+            Order of joints: yaw, roll, pitch, yaw, roll, pitch.
+            Left-right order is arbitrary.
+        body_pitch_angle: Body pitch angle for initial flight pose, relative to
+            ground, degrees. 0: horizontal body position. Default value from
+            https://doi.org/10.1126/science.1248955
+
+    Returns:
+        Wing angles transformed to conventional representation.
+    """
+    if not isinstance(model_wing_qpos, np.ndarray):
+        model_wing_qpos = np.array(model_wing_qpos)
+    conventional = np.zeros_like(model_wing_qpos)
+    body_pitch_angle = np.deg2rad(body_pitch_angle)
+    # Yaw, doesn't require transformation.
+    conventional[..., [0, 3]] = model_wing_qpos[..., [0, 3]].copy()
+    # Roll.
+    conventional[..., [1, 4]] = - model_wing_qpos[..., [1, 4]]
+    # Pitch.
+    conventional[..., [2, 5]] = (
+        np.pi / 2 - body_pitch_angle - model_wing_qpos[..., [2, 5]])
+    return conventional
+
+
 def get_random_policy(action_spec: 'dm_env.specs.BoundedArray',
                       minimum: float = -0.2,
                       maximum: float = 0.2) -> Callable[[Any], np.ndarray]:
@@ -40,15 +71,15 @@ def real2canonical(action: np.ndarray,
                    clip: bool = True) -> np.ndarray:
     """Transform action of real (not wrapped) environment to canonical
     representation in range [-1, 1].
-    
+
     Any number of leading batch dimensions is supported.
-    
+
     Args:
         action: Action in real (not wrapped) environment, shape (B, D).
                 D is the dimensionality of action space (action size).
         action_spec: Action spec of real (not wrapped) environment.
         clip: Whether to clip action to limits specified in action_spec.
-        
+
     Returns:
         canonical_action: Action in canonical representation, (B, D).
     """
@@ -68,15 +99,15 @@ def canonical2real(action: np.ndarray,
                    clip: bool = True) -> np.ndarray:
     """Transform action in canonical representation in range [-1, 1] to
     action in real (not wrapped) environment.
-    
+
     Any number of leading batch dimensions is supported.
-    
+
     Args:
         action: Action in canonical representation, (B, D).
                 D is the dimensionality of action space (action size).
         action_spec: Action spec of real (not wrapped) environment.
         clip: Whether to clip action to canonical limits [-1, 1].
-        
+
     Returns:
         real_action: Action in real (not wrapped) environment, (B, D).
     """
@@ -87,7 +118,7 @@ def canonical2real(action: np.ndarray,
     offset = action_spec.minimum
     real_action = 0.5 * (action + 1)  # Now in range [0, 1].
     real_action *= scale
-    real_action += offset    
+    real_action += offset
     return real_action
 
 
@@ -230,3 +261,293 @@ def com2root(com, quat, offset=None):
     offset_global = rotate_vec_with_quat(-offset, quat)
     root_pos = com + offset_global
     return root_pos
+
+
+mapping_rules = {
+    'an': [
+        'accelerometer', 'gyro', 'joints_pos', 'joints_vel', 'velocimeter', 'ref_displacement', 'ref_root_quat'
+    ],
+    'wind_gravity': [
+        'world_zaxis',
+    ],
+    'vision': [
+        "eye_hex_pixels" # 'left_eye', 'right_eye'
+    ],
+    'fake_target': [
+        'task_input',
+    ],
+}
+
+
+def compute_channel_dims(obs_spec, mapping_rules=mapping_rules):
+    """
+    Compute channel dimensions for different observation regions.
+    """
+    result = {k: 0 for k in mapping_rules.keys()}
+
+    # Convert obs_spec keys to remove prefixes.
+    # "walker/accelerometer" → "accelerometer"
+    _obs_spec = {
+        key.split("/")[-1]: shape for key, shape in obs_spec.items()
+    }
+    for region, keys in mapping_rules.items():
+        total_dim = 0
+        for k in keys:
+            if k in _obs_spec:
+                shape = _obs_spec[k].shape
+                total_dim += int(np.prod(shape))
+        result[region] = total_dim
+
+    return result
+
+
+def map_obs2regions(obs: list[OrderedDict] | dict[str, torch.Tensor],
+                    mapping_rules=mapping_rules) -> dict[str, np.ndarray]:
+    """
+    Map observation dictionary to different observation regions.
+    Args:
+        obs:
+        if obs is a list, obs: list[OrderedDict] of length n_env, each OrderedDict is an observation
+        if obs is a dict, obs: dict[str, torch.Tensor] with shape [n_env, obs_dim]
+        mapping_rules: Mapping rules from observation keys to regions.
+
+    """
+    region_obs = {k: [] for k in mapping_rules.keys()}
+    if isinstance(obs, list):
+        #
+        for region, keys in mapping_rules.items():
+            #
+            region_array = []
+            for env_obs in obs:
+                selected_parts = []
+                for k in keys:
+                    env_key = f"walker/{k}"
+                    if env_key in env_obs:
+                        selected_parts.append(env_obs[env_key].ravel())
+                if selected_parts:
+                    region_array.append(np.concatenate(selected_parts))
+                else:
+                    region_array.append(np.array([], dtype=np.float32))
+            region_obs[region] = np.stack(region_array, axis=0)
+    elif isinstance(obs, dict):
+        for region, keys in mapping_rules.items():
+            #
+            selected_parts = []
+            for k in keys:
+                env_key = f"walker/{k}"
+                if env_key in obs:
+                    selected_parts.append(
+                        obs[env_key].reshape(obs[env_key].shape[0], -1)
+                    )
+            if selected_parts:
+                region_obs[region] = torch.cat(selected_parts, dim=-1)
+            else:
+                region_obs[region] = torch.empty(
+                    (obs[list(obs.keys())[0]].shape[0], 0), dtype=torch.float32
+                )
+    return region_obs
+
+
+def blow_hw(x, col_repeats=2, row_repeats=2):
+    """Repeat columns and rows requested number of times."""
+    return np.repeat(np.repeat(x, row_repeats, axis=0), col_repeats, axis=1)
+
+
+def cal_mlp_obs(obs: list[OrderedDict] | dict[str, torch.Tensor],
+                device: str = 'cpu',
+                mapping_rules=mapping_rules) -> dict[str, np.ndarray]:
+    """
+    Map observation dictionary to different observation regions and concatenate them.
+    """
+    region_obs = {k: [] for k in mapping_rules.keys()}
+    if isinstance(obs, list):
+        #
+        for region, keys in mapping_rules.items():
+            #
+            region_array = []
+            for env_obs in obs:
+                selected_parts = []
+                for k in keys:
+                    env_key = f"walker/{k}"
+                    if env_key in env_obs:
+                        selected_parts.append(env_obs[env_key].ravel())
+                if selected_parts:
+                    region_array.append(np.concatenate(selected_parts))
+                else:
+                    region_array.append(np.array([], dtype=np.float32))
+            region_obs[region] = np.stack(region_array, axis=0)
+    elif isinstance(obs, dict):
+        for region, keys in mapping_rules.items():
+            #
+            selected_parts = []
+            for k in keys:
+                env_key = f"walker/{k}"
+                if env_key in obs:
+                    selected_parts.append(
+                        obs[env_key].reshape(obs[env_key].shape[0], -1)
+                    )
+            if selected_parts:
+                region_obs[region] = torch.cat(selected_parts, dim=-1)
+            else:
+                region_obs[region] = torch.empty(
+                    (obs[list(obs.keys())[0]].shape[0], 0), dtype=torch.float32, device=device
+                )
+
+    values = []
+    for v in region_obs.values():
+        values.append(v)
+    if isinstance(values[0], torch.Tensor):
+        mlp_obs = torch.cat(values, dim=-1)
+    elif isinstance(values[0], np.ndarray):
+        mlp_obs = np.concatenate(values, axis=-1)
+
+    return mlp_obs
+
+
+def torch_batch_concat(inputs):
+    """
+    Flatten a dict of single-step tensors (no batch dim) into a single tensor,
+    adding a batch dimension of 1. Empty tensors are supported.
+
+    Args:
+        inputs: dict of tensors (torch or numpy), shapes like (3,), (6,3), (0,), etc.
+
+    Returns:
+        Tensor of shape (1, D), concatenated along feature dim, preserving batch.
+    """
+    leaves = []
+
+    def _flatten(x):
+        # numpy -> torch
+        if isinstance(x, np.ndarray):
+            x = torch.as_tensor(x, dtype=torch.float32)
+
+        if torch.is_tensor(x):
+            # empty tensor
+            if x.numel() == 0:
+                return x.new_empty(1, 0)
+            # add batch dim if missing
+            if x.dim() == 1:
+                x = x.unsqueeze(0)  # (D,) -> (1,D)
+            else:
+                x = x.unsqueeze(0)  # (D1,D2,...) -> (1,D1,D2,...)
+            return x.view(1, -1)   # flatten non-batch dims
+        elif isinstance(x, Mapping):
+            for key in sorted(x.keys()):
+                leaves.append(_flatten(x[key]))
+        elif isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+            for v in x:
+                leaves.append(_flatten(v))
+        else:
+            raise TypeError(f"Unsupported type in batch_concat: {type(x)}")
+
+    _flatten(inputs)
+
+    if not leaves:
+        raise ValueError("No tensors found to concatenate in batch_concat.")
+
+    return torch.cat(leaves, dim=-1)
+
+
+def torch_batch_concat_batched(inputs, *, dtype=torch.float32, device=None, key_order=None):
+    """
+    Flatten a nested dict/list of tensors that ALREADY contain a batch dimension.
+
+    Args:
+        inputs: Mapping/Sequence/tensor/ndarray. Leaf tensors shapes like:
+                (B, D), (B, 6, 3), (B, 0), etc.
+        dtype:  force dtype for tensors
+        device: move output (and leaves) to device
+        key_order: optional explicit order for top-level mapping keys
+                   (recommended instead of sorted)
+
+    Returns:
+        Tensor of shape (B, D_total)
+    """
+    leaves = []
+    batch_size = None
+
+    def _as_tensor(x):
+        nonlocal batch_size
+        if isinstance(x, np.ndarray):
+            x = torch.as_tensor(x, dtype=dtype)
+        elif torch.is_tensor(x):
+            x = x.to(dtype=dtype)
+        else:
+            raise TypeError(f"Unsupported leaf type: {type(x)}")
+
+        if device is not None:
+            x = x.to(device)
+
+        # x should have batch dim
+        if x.dim() == 0:
+            raise ValueError("Leaf tensor must have batch dim, got scalar.")
+        if x.dim() == 1:
+            # treat (B,) as (B,1)
+            x = x.unsqueeze(-1)
+
+        # validate batch size
+        B = x.shape[0]
+        if batch_size is None:
+            batch_size = B
+        elif B != batch_size:
+            raise ValueError(f"Inconsistent batch size: expected {batch_size}, got {B}")
+
+        # empty feature dim supported: (B,0) or (B,0,...) => flatten => (B,0)
+        return x.reshape(B, -1)
+
+    def _flatten(x):
+        if isinstance(x, Mapping):
+            keys = list(x.keys()) if key_order is None else [k for k in key_order if k in x]
+            if key_order is None:
+                keys = sorted(keys)
+            for k in keys:
+                _flatten(x[k])
+        elif isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+            for v in x:
+                _flatten(v)
+        else:
+            leaves.append(_as_tensor(x))
+
+    _flatten(inputs)
+
+    if not leaves:
+        raise ValueError("No tensors found to concatenate.")
+
+    # batch_size is set by first leaf
+    return torch.cat(leaves, dim=-1)
+
+
+def get_low_level_obs(
+    obss,
+) -> dict[str, np.ndarray]:
+    """
+    Get low-level observation from timestep.
+    Args:
+        obs: list [dm_env TimeStep.observation object].
+    """
+    obs_keys = [
+        'accelerometer', 'gyro', 'joints_pos', 'joints_vel',
+        'velocimeter', 'world_zaxis',]
+    obs = {}
+
+    for key in obs_keys:
+        env_key = f"walker/{key}"
+        part = []
+        for ts in obss:
+            part.append(ts[env_key].ravel())
+        part_array = np.stack(part, axis=0)
+        obs[env_key] = part_array
+
+    return obs
+
+
+def flatten_obs(obs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """
+    Flatten observation dict to a single tensor.
+    Args:
+        obs: dict of tensors, each with shape (B, D_i).
+    Returns:
+        Tensor of shape (B, D_total).
+    """
+    return torch_batch_concat(obs)

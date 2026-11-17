@@ -7,13 +7,15 @@ import numpy as np
 from dm_control.utils import rewards
 
 from flybody.tasks.base import Walking
-from flybody.tasks.constants import (_TERMINAL_ANGVEL, _TERMINAL_LINVEL)
-from flybody.tasks.rewards import (get_reference_features, get_walker_features,
-                                   reward_factors_deep_mimic)
+from flybody.tasks.rewards import (
+    get_reference_features, get_walker_features, reward_factors_deep_mimic
+)
 from flybody.tasks.trajectory_loaders import HDF5WalkingTrajectoryLoader
-from flybody.tasks.task_utils import (add_trajectory_sites,
-                                      update_trajectory_sites)
+from flybody.tasks.task_utils import (
+    add_trajectory_sites,update_trajectory_sites
+)
 from flybody.quaternions import rotate_vec_with_quat
+from flybody.tasks.constants import (_TERMINAL_ANGVEL, _TERMINAL_LINVEL)
 
 
 class WalkImitation(Walking):
@@ -116,7 +118,6 @@ class WalkImitation(Walking):
 
         # Set full initial qpos
         physics.bind(self._mocap_joints).qpos = self._ref_qpos[0, :]
-
         # Maybe set initial qvel.
         if self._initialize_qvel:
             physics.bind(self._mocap_joints).qvel = self._ref_qvel[0, :]

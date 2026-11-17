@@ -2,6 +2,8 @@
 
 from typing import Dict
 import numpy as np
+import torch
+import torch.nn as nn
 
 from flybody import quaternions
 
@@ -114,3 +116,49 @@ def reward_factors_deep_mimic(walker_features,
     reward_factors *= np.asarray(weights)
 
     return reward_factors
+
+
+
+class PenalizationCostRealActions:
+    """Convert canonical actions to real environment actions
+       and calculate penalization cost based on real actions."""
+
+    def __init__(self, action_spec, dtype=torch.float32, custom_cost_func=None):
+        """
+        Args:
+            action_spec: Environment action spec with .minimum and .maximum
+            dtype: torch dtype for calculations
+            custom_cost_func: Optional callable for custom penalization cost
+        """
+        self._scale = torch.tensor(action_spec.maximum - action_spec.minimum,
+                                   dtype=dtype)
+        self._offset = torch.tensor(action_spec.minimum, dtype=dtype)
+
+        assert not torch.all(self._scale == 2) and not torch.all(self._offset == -1), (
+            "With the provided action_spec, the action transformation is no-op. "
+            "Perhaps this action_spec is already canonical?"
+        )
+
+        if custom_cost_func is None:
+            # Default: negative L2 norm
+            def cost_func(actions):
+                # Compute L2 norm along the last dimension
+                cost = -torch.norm(actions, dim=-1)
+                return cost
+            self._cost_func = cost_func
+        else:
+            self._cost_func = custom_cost_func
+
+    def __call__(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            actions: Canonical actions in [-1, 1], shape (B, D) or any batch dims
+        Returns:
+            Penalization cost based on real actions
+        """
+        # [-1,1] -> [0,1]
+        actions = 0.5 * (actions + 1.0)
+        # [0,1] -> [min,max]
+        actions = actions * self._scale + self._offset
+        # Compute penalization cost
+        return self._cost_func(actions)

@@ -315,6 +315,7 @@
       <camera name="side" mode="track" pos="-0.045 0.424 -0.035" xyaxes="-1 0 0 0 0 1"/>
       <camera name="bottom" mode="track" pos="0.01 0 -0.516" xyaxes="0 1 0 0.991 0 0.136"/>
       <camera name="hero" mode="track" pos="0.271 0.27 -0.044" xyaxes="-0.641 0.767 0 -0.045 -0.037 0.998"/>
+      <camera name="back_top" mode="track" pos="5 0 20" xyaxes="0 -1 0 0.991 0 0.136"/>
       <light name="left" mode="trackcom" pos="0 1 1" dir="0 -1 -1" diffuse="0.3 0.3 0.3"/>
       <light name="tracking" mode="trackcom" pos="0 0 1"/>
       <site name="thorax"/>

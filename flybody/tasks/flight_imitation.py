@@ -7,8 +7,9 @@ from dm_control.utils import rewards
 from flybody.tasks.pattern_generators import WingBeatPatternGenerator
 from flybody.tasks.trajectory_loaders import HDF5FlightTrajectoryLoader
 from flybody.quaternions import quat_dist_short_arc
-from flybody.tasks.task_utils import (com2root, root2com, add_trajectory_sites,
-                                      update_trajectory_sites)
+from flybody.tasks.task_utils import (
+    com2root, root2com, add_trajectory_sites,update_trajectory_sites
+)
 from flybody.tasks.constants import _TERMINAL_HEIGHT
 from flybody.tasks.base import Flying
 
@@ -35,12 +36,29 @@ class FlightImitationWBPG(Flying):
         """
 
         super().__init__(add_ghost=True, num_user_actions=1, **kwargs)
+        # actuators = self._walker.mjcf_model.find_all('actuator')
+        # joints = self._walker.mjcf_model.find_all('joint')
+        # for j in joints:
+        #     print(j.name, j.range)
+        # for a in actuators:
+        #     if "wing" in a.name.lower():
+        #         print(a)
+        #         print(a.tag)
+        #         print(a.ctrlrange)
+        #         # print(a.dclass.range)
+        #         print(a.forcerange)
+        #         print(a.forcelimited)
+        # assert False
+        # print("Gravity:", self._walker.mjcf_model.option.gravity)     # numpy array [gx, gy, gz]
+        # print("Air density:", self._walker.mjcf_model.option.density)
+        # print("Air viscosity:", self._walker.mjcf_model.option.viscosity)
+        # assert False
 
         self._wbpg = wbpg
         self._traj_generator = traj_generator
         self._terminal_com_dist = terminal_com_dist
         self._trajectory_sites = trajectory_sites
-        self._next_traj_idx = None
+        self._next_traj_idx =  None  # None
 
         # Add axis crosshair.
         self._crosshair_sites = []
@@ -63,8 +81,7 @@ class FlightImitationWBPG(Flying):
 
         # Maybe add trajectory sites, one every 10 steps.
         if self._trajectory_sites:
-            self._n_traj_sites = (
-                round(self._time_limit / self.control_timestep) + 1) // 10
+            self._n_traj_sites = (round(self._time_limit / self.control_timestep) + 1) // 10
             add_trajectory_sites(self.root_entity, self._n_traj_sites, group=1)
 
         # Explicitly add tracking task observables.
@@ -126,7 +143,7 @@ class FlightImitationWBPG(Flying):
 
         # Reset wing pattern generator and get initial wing qpos.
         init_wing_qpos, init_wing_qvel = self._wbpg.reset(
-            initial_phase=random_state.uniform(), return_qvel=True)
+            initial_phase=1, return_qvel=True)
         # Initialize root position and orientation.
         self._walker.set_pose(physics, self._ref_qpos[0, :3],
                               self._ref_qpos[0, 3:])
@@ -134,7 +151,9 @@ class FlightImitationWBPG(Flying):
         physics.bind(self._wing_joints).qpos = init_wing_qpos
         # Initialize wing qvel.
         physics.bind(self._wing_joints).qvel = init_wing_qvel
-
+        # print(self._wing_joints)
+        # print("init_wing_qpos: ", init_wing_qpos)
+        # print("init_wing_qvel: ", init_wing_qvel)
         if self._initialize_qvel:
             # Only initialize linear CoM velocity, not rotational velocity.
             self._walker.set_velocity(physics, self._ref_qvel[0, :3])
@@ -147,6 +166,7 @@ class FlightImitationWBPG(Flying):
                     random_state: np.random.RandomState):
         """Combine action with WPG base pattern. Update ghost pos and vel."""
         # Get target wing joint angles at beat frequency requested by the agent.
+
         base_freq, rel_range = self._wbpg.base_beat_freq, self._wbpg.rel_freq_range
         act = action[self._user_idx_action]  # action in [-1, 1].
         ctrl_freq = base_freq * (1 + rel_range * act)
@@ -154,9 +174,14 @@ class FlightImitationWBPG(Flying):
             ctrl_freq=ctrl_freq)  # Returns position control.
 
         length = physics.bind(self._wing_joints).qpos
+        # print(f"ctrl: {ctrl}")
+        # print(f"length: {length}")
+        # print(f"action: {action[self._wing_inds_action]}")
         # Convert position control to force control.
         action[self._wing_inds_action] += (ctrl - length)
-
+        # action[self._wing_inds_action] = [1, 1, 1, 1, 1, 1]
+        # print(f"dt: {ctrl - length}")
+        # print(f"new action: {action[self._wing_inds_action]}")
         # Update ghost joint pos and vel.
         step = int(np.round(physics.data.time / self.control_timestep))
         ghost_qpos = self._ref_qpos[step, :] + np.hstack(
@@ -172,6 +197,8 @@ class FlightImitationWBPG(Flying):
 
         # Reference CoM displacement reward.
         ghost_xpos, ghost_quat = self._ghost.get_pose(physics)
+        # print("ghost_xpos: ", ghost_xpos.shape, ghost_xpos)
+        # print("ghost_quat: ", ghost_quat.shape, ghost_quat)
         ghost_com = root2com(np.concatenate((ghost_xpos, ghost_quat)))
         model_com = physics.named.data.subtree_com['walker/']
         displacement = np.linalg.norm(ghost_com - model_com)

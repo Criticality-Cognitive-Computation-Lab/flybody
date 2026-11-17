@@ -15,6 +15,11 @@ from dm_control.utils.transformations import quat_mul
 from dm_env import specs
 import numpy as np
 
+from flybody.tasks.task_utils import(
+    blow_hw,
+)
+from flygym.vision.retina import Retina
+
 enums = mjbindings.enums
 mjlib = mjbindings.mjlib
 
@@ -137,7 +142,7 @@ class FruitFly(legacy_base.Walker):
         control_timestep: float = 2e-3,
         num_user_actions: int = 0,
         eye_camera_fovy: float = 150.,
-        eye_camera_size: int = 32,
+        eye_camera_size: int = (32, 32),
     ):
         """Build a fruitfly walker.
 
@@ -174,6 +179,8 @@ class FruitFly(legacy_base.Walker):
         self._control_timestep = control_timestep
         self._buffer_size = int(round(control_timestep / physics_timestep))
         self._eye_camera_size = eye_camera_size
+        self._olfaction_callback = None
+        self._odor_dimension_names = ()
         root = mjcf.from_path(_XML_PATH)
         self._mjcf_root = root
         if name:
@@ -277,6 +284,32 @@ class FruitFly(legacy_base.Walker):
             for joint in antenna_joints:
                 root.find('actuator', joint.name).remove()
                 self.observable_joints.remove(joint)
+
+        self._olfaction_sensor_site_names = (
+            'odor_sensor_antenna_left',
+            'odor_sensor_antenna_right',
+            'odor_sensor_palp_left',
+            'odor_sensor_palp_right',
+        )
+        olfaction_sites = (
+            ('antenna_left', 'odor_sensor_antenna_left', (0.0, 0.0115, 0.0025)),
+            ('antenna_right', 'odor_sensor_antenna_right', (0.0, -0.0115, -0.0025)),
+            ('labrum_left', 'odor_sensor_palp_left', (-0.0006, 0.0106, -0.0044)),
+            ('labrum_right', 'odor_sensor_palp_right', (0.0012, 0.0106, -0.0041)),
+        )
+        for body_name, site_name, pos in olfaction_sites:
+            body = root.find('body', body_name)
+            if body is None or body.find('site', site_name) is not None:
+                continue
+            body.add(
+                'site',
+                name=site_name,
+                type='sphere',
+                size=(0.0015,),
+                pos=pos,
+                rgba=(0.2, 0.8, 1.0, 0.0),
+                group=3,
+            )
 
         # === For flight, set body pitch angle and stroke plane angle.
         if use_wings:
@@ -452,6 +485,15 @@ class FruitFly(legacy_base.Walker):
         return self.mjcf_model.find('site', 'head')
 
     @composer.cached_property
+    def olfaction_sensor_sites(self):
+        sites = []
+        for site_name in self._olfaction_sensor_site_names:
+            site = self.mjcf_model.find('site', site_name)
+            if site is not None:
+                sites.append(site)
+        return tuple(sites)
+
+    @composer.cached_property
     def observable_joints(self):
         return self.mjcf_model.find_all('joint')
 
@@ -496,6 +538,20 @@ class FruitFly(legacy_base.Walker):
         return FruitFlyObservables(self, self._buffer_size,
                                    self._eye_camera_size)
 
+    def configure_olfaction(self, callback=None, odor_dimension_names=()):
+        self._olfaction_callback = callback
+        self._odor_dimension_names = tuple(odor_dimension_names)
+
+    def get_olfaction(self, sensor_pos):
+        sensor_pos = np.asarray(sensor_pos, dtype=np.float32)
+        if self._olfaction_callback is None:
+            return np.zeros(
+                (len(self._odor_dimension_names), sensor_pos.shape[0]),
+                dtype=np.float32,
+            )
+        odor = self._olfaction_callback(sensor_pos)
+        return np.asarray(odor, dtype=np.float32)
+
     @composer.cached_property
     def left_eye(self):
         """Return the left_eye camera."""
@@ -532,11 +588,18 @@ class FruitFly(legacy_base.Walker):
             return
         # Update previous action.
         self._prev_action[:] = action
+        # for i, subactuator in enumerate(self.mjcf_model.find_all('actuator')):
+        #     print(i, subactuator.name)
+        # assert False
         # Apply MuJoCo actions.
         ctrl = np.zeros(physics.model.nu)
         for key, indices in self._action_indices.items():
             if self._ctrl_indices[key] and indices:
+                # if "wings" in key:
+                #     print(key, self._ctrl_indices[key], action[indices])
                 ctrl[self._ctrl_indices[key]] = action[indices]
+                #
+        # print("ctrl: ", ctrl)
         physics.set_control(ctrl)
 
     # -------------------------------------------------------------------------
@@ -585,6 +648,7 @@ class FruitFlyObservables(legacy_base.WalkerObservables):
         self._walker = walker
         self._buffer_size = buffer_size
         self._eye_camera_size = eye_camera_size
+        self.retina = Retina()
         super().__init__(walker)
 
     @composer.observable
@@ -730,10 +794,9 @@ class FruitFlyObservables(legacy_base.WalkerObservables):
             self._scene_options = mj_wrapper.MjvOption()
             cosmetic_geom_group = 1
             self._scene_options.geomgroup[cosmetic_geom_group] = 1
-
         return observable.MJCFCamera(self._entity.right_eye,
-                                     width=self._eye_camera_size,
-                                     height=self._eye_camera_size,
+                                     width=self._eye_camera_size[1],
+                                     height=self._eye_camera_size[0],
                                      scene_option=self._scene_options)
 
     @composer.observable
@@ -747,6 +810,74 @@ class FruitFlyObservables(legacy_base.WalkerObservables):
             self._scene_options.geomgroup[cosmetic_geom_group] = 1
 
         return observable.MJCFCamera(self._entity.left_eye,
-                                     width=self._eye_camera_size,
-                                     height=self._eye_camera_size,
+                                     width=self._eye_camera_size[1],
+                                     height=self._eye_camera_size[0],
                                      scene_option=self._scene_options)
+
+    @composer.observable
+    def eye_hex_pixels(self):
+        def _eye_to_hex_pixels(eye_img: np.ndarray) -> np.ndarray:
+            eye_gray = np.asarray(eye_img, dtype=np.float32).mean(axis=-1)
+            eye_rgb = np.tile(eye_gray[:, :, None], reps=(1, 1, 3))
+            row_repeats = max(
+                1, int(round(float(self.retina.nrows) / float(eye_rgb.shape[0])))
+            )
+            col_repeats = max(
+                1, int(round(float(self.retina.ncols) / float(eye_rgb.shape[1])))
+            )
+            eye_rgb = blow_hw(eye_rgb, col_repeats=col_repeats, row_repeats=row_repeats)
+            if eye_rgb.shape[0] < self.retina.nrows:
+                pad_rows = self.retina.nrows - eye_rgb.shape[0]
+                eye_rgb = np.pad(eye_rgb, ((0, pad_rows), (0, 0), (0, 0)), mode="edge")
+            else:
+                eye_rgb = eye_rgb[: self.retina.nrows, ...]
+            if eye_rgb.shape[1] < self.retina.ncols:
+                pad_cols = self.retina.ncols - eye_rgb.shape[1]
+                eye_rgb = np.pad(eye_rgb, ((0, 0), (0, pad_cols), (0, 0)), mode="edge")
+            else:
+                eye_rgb = eye_rgb[:, : self.retina.ncols, ...]
+
+            eye_fish_img = np.ascontiguousarray(np.clip(eye_rgb, 0, 255).astype(np.uint8))
+            return self.retina.raw_image_to_hex_pxls(eye_fish_img)
+
+        def _get_hex_vision(physics):
+            left_eye = self.left_eye(physics)
+            right_eye = self.right_eye(physics)
+            left_eye_hex = _eye_to_hex_pixels(left_eye)
+            right_eye_hex = _eye_to_hex_pixels(right_eye)
+            return np.stack((left_eye_hex, right_eye_hex), axis=0).astype(
+                np.float32, copy=False
+            )
+
+        return observable.Generic(_get_hex_vision)
+
+    @composer.observable
+    def odor_intensity(self):
+        """Odor intensity at four virtual olfactory sensor sites."""
+
+        def _get_odor_intensity(physics):
+            sensor_pos = physics.bind(self._entity.olfaction_sensor_sites).xpos
+            return self._walker.get_olfaction(sensor_pos)
+
+        return observable.Generic(_get_odor_intensity)
+
+
+    # @composer.observable
+    # def eye_hex_pixels(self):
+    #     def _get_hex_vision(timestep):
+    #         left_eye = timestep.observation['walker/left_eye'].mean(axis=-1)
+    #         right_eye = timestep.observation['walker/right_eye'].mean(axis=-1)
+    #         left_eye = np.tile(left_eye[:, :, None], reps=(1, 1, 3))
+    #         right_eye = np.tile(right_eye[:, :, None], reps=(1, 1, 3))
+    #         left_eye = blow_hw(left_eye, col_repeats=9, row_repeats=8)
+    #         right_eye = blow_hw(right_eye, col_repeats=9, row_repeats=8)
+    #         #
+    #         hex_pixels = np.zeros((2, 721, 2))
+    #         left_fish_img = np.ascontiguousarray(self.retina.correct_fisheye(left_eye))
+    #         right_fish_img = np.ascontiguousarray(self.retina.correct_fisheye(right_eye))
+    #         left_eye_hex = self.retina.raw_image_to_hex_pxls(left_fish_img)
+    #         right_eye_hex = self.retina.raw_image_to_hex_pxls(right_fish_img)
+    #         hex_pixels = np.stack((left_eye_hex, right_eye_hex), axis=0)
+    #         return hex_pixels
+
+    #     return observable.Generic(_get_hex_vision)
