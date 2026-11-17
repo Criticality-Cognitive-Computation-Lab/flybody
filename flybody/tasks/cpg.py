@@ -65,12 +65,12 @@ class FlyBodyCPGController:
     legs = LEG_ORDER
     flybody_dofs = DOFS_PER_LEG
 
-    def __init__(self, config: FlyBodyCPGConfig | None = None):
+    def __init__(self, config: FlyBodyCPGConfig):
         from pathlib import Path
 
         import h5py
 
-        self.config = config or FlyBodyCPGConfig()
+        self.config = config
         if self.config.timestep <= 0 or self.config.convergence <= 0:
             raise ValueError("timestep and convergence must be positive")
         if self.config.period_frames < 4 or self.config.average_cycles < 1:
