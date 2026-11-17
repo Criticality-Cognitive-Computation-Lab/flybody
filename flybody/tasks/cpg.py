@@ -1,5 +1,6 @@
+from dataclasses import dataclass
+
 import numpy as np
-import pandas as pd
 from scipy.interpolate import CubicSpline
 
 
@@ -11,6 +12,7 @@ LEG_MAPPING = {
     "T3_left": "LH",
     "T3_right": "RH",
 }
+LEG_NAMES = {short: full for full, short in LEG_MAPPING.items()}
 
 DOFS_PER_LEG = [
     "coxa_abduct",
@@ -28,235 +30,228 @@ TRIPOD_GROUP_A = ["LF", "RM", "LH"]
 TRIPOD_GROUP_B = ["RF", "LM", "RH"]
 
 
-def calculate_ddt(theta, r, w, phi, nu, R, alpha):
-    intrinsic_term = 2 * np.pi * nu
-    phase_diff = theta[np.newaxis, :] - theta[:, np.newaxis]
-    coupling_term = (r * w * np.sin(phase_diff - phi)).sum(axis=1)
-    dtheta_dt = intrinsic_term + coupling_term
-    dr_dt = alpha * (R - r)
-    return dtheta_dt, dr_dt
+@dataclass(frozen=True)
+class FlyBodyCPGConfig:
+    """CPG settings for a periodic FlyBody joint template."""
+
+    template_path: str
+    trajectory_id: str = "005"
+    start_frame: int = 36
+    period_frames: int = 37
+    average_cycles: int = 4
+    # The source FlyBody recording is sampled every 2 ms; update the
+    # controller at that same cadence and let MuJoCo substep independently.
+    timestep: float = 2e-3
+    frequency: float | None = None
+    convergence: float = 20.0
+    amplitude_scale: float = 1.0
+    initial_phase: float = 0.0
+    randomize_phase: bool = False
+    straight_turn_trim: float = 0.05
+    seed: int = 0
 
 
-class CPGNetwork:
-    def __init__(
-        self,
-        timestep,
-        intrinsic_freqs,
-        intrinsic_amps,
-        coupling_weights,
-        phase_biases,
-        convergence_coefs,
-        init_phases=None,
-        init_magnitudes=None,
-        seed=0,
-    ):
-        self.timestep = timestep
-        self.num_cpgs = intrinsic_freqs.size
-        self.intrinsic_freqs = intrinsic_freqs
-        self.intrinsic_amps = intrinsic_amps
-        self.coupling_weights = coupling_weights
-        self.phase_biases = phase_biases
-        self.convergence_coefs = convergence_coefs
-        self.random_state = np.random.RandomState(seed)
+class FlyBodyCPGController:
+    """Drive FlyBody position actuators from a periodic FlyBody qpos template.
 
-        self.reset(init_phases, init_magnitudes)
+    A scalar phase oscillator traverses a synchronized six-leg position cycle
+    sampled from a FlyBody recording.  The relative timing between legs is
+    already present in that six-leg template, so a second hand-authored tripod
+    phase offset is intentionally not applied.  Root pose is never read by the
+    controller.  The recording has no adhesion labels, so the controller does
+    not invent stance timing from root/site tracks and leaves claw adhesion off.
+    """
 
-    def step(self):
-        dtheta_dt, dr_dt = calculate_ddt(
-            theta=self.curr_phases,
-            r=self.curr_magnitudes,
-            w=self.coupling_weights,
-            phi=self.phase_biases,
-            nu=self.intrinsic_freqs,
-            R=self.intrinsic_amps,
-            alpha=self.convergence_coefs,
+    legs = LEG_ORDER
+    flybody_dofs = DOFS_PER_LEG
+
+    def __init__(self, config: FlyBodyCPGConfig | None = None):
+        from pathlib import Path
+
+        import h5py
+
+        self.config = config or FlyBodyCPGConfig()
+        if self.config.timestep <= 0 or self.config.convergence <= 0:
+            raise ValueError("timestep and convergence must be positive")
+        if self.config.period_frames < 4 or self.config.average_cycles < 1:
+            raise ValueError("period_frames must be >= 4 and average_cycles >= 1")
+        if self.config.amplitude_scale <= 0:
+            raise ValueError("amplitude_scale must be positive")
+        if not np.isfinite(self.config.initial_phase):
+            raise ValueError("initial_phase must be finite")
+        if not -1.0 <= self.config.straight_turn_trim <= 1.0:
+            raise ValueError("straight_turn_trim must be in [-1, 1]")
+        template_path = Path(self.config.template_path).expanduser().resolve()
+        if not template_path.is_file():
+            raise FileNotFoundError(
+                f"Missing FlyBody walking template: {template_path}"
+            )
+        self.template_path = template_path
+        self.timestep = float(self.config.timestep)
+
+        leg_joint_names = [
+            f"{dof}_{LEG_NAMES[leg]}"
+            for leg in self.legs
+            for dof in self.flybody_dofs
+        ]
+        with h5py.File(template_path, "r") as h5:
+            if self.config.trajectory_id not in h5["trajectories"]:
+                raise KeyError(
+                    f"Trajectory {self.config.trajectory_id!r} not found in "
+                    f"{template_path}"
+                )
+            qpos_names = [
+                value.decode() if isinstance(value, bytes) else str(value)
+                for value in h5["id2name"]["qpos"][:]
+            ]
+            data_timestep = float(h5["timestep_seconds"][()])
+            trajectory = h5["trajectories"][self.config.trajectory_id]
+            needed = (
+                self.config.start_frame
+                + self.config.period_frames * self.config.average_cycles
+            )
+            if needed > len(trajectory["qpos"]):
+                raise ValueError(
+                    f"Template window ends at frame {needed}, but trajectory "
+                    f"{self.config.trajectory_id} has {len(trajectory['qpos'])} frames"
+                )
+            joint_indices = [qpos_names.index(name) for name in leg_joint_names]
+            cycle_qpos = np.stack([
+                trajectory["qpos"][
+                    self.config.start_frame + cycle * self.config.period_frames:
+                    self.config.start_frame + (cycle + 1) * self.config.period_frames
+                ][:, joint_indices].reshape(self.config.period_frames, 6, 8)
+                for cycle in range(self.config.average_cycles)
+            ])
+
+        if data_timestep <= 0:
+            raise ValueError("template timestep must be positive")
+        self.template_dt = data_timestep
+        self.period_seconds = self.config.period_frames * data_timestep
+        self.frequency = (
+            float(self.config.frequency)
+            if self.config.frequency is not None
+            else 1.0 / self.period_seconds
         )
-        self.curr_phases = (self.curr_phases + dtheta_dt * self.timestep) % (2 * np.pi)
-        self.curr_magnitudes = self.curr_magnitudes + dr_dt * self.timestep
-        self.curr_magnitudes = np.clip(self.curr_magnitudes, 0.0, 1.0)
+        if self.frequency <= 0:
+            raise ValueError("frequency must be positive")
 
-    def reset(self, init_phases=None, init_magnitudes=None):
-        if init_phases is None:
-            self.curr_phases = self.random_state.random(self.num_cpgs) * 2 * np.pi
-        else:
-            self.curr_phases = np.asarray(init_phases, dtype=float)
-
-        if init_magnitudes is None:
-            self.curr_magnitudes = np.zeros(self.num_cpgs, dtype=float)
-        else:
-            self.curr_magnitudes = np.asarray(init_magnitudes, dtype=float)
-
-
-class CPGController:
-    def __init__(self, cpg_network, legs, psi_funcs, psi_rest_phases, dofs_per_leg, all_leg_dofs):
-        self.cpg_network = cpg_network
-        self.legs = legs
-        self.psi_funcs = psi_funcs
-        self.psi_rest_phases = psi_rest_phases
-        self.dofs_per_leg = dofs_per_leg
-        self.all_leg_dofs = all_leg_dofs
-
-    def step(self):
-        self.cpg_network.step()
-        joints_angles = {}
-
-        for i, leg in enumerate(self.legs):
-            psi = self.psi_funcs[leg](self.cpg_network.curr_phases[i])
-            adjusted_psi = psi
-
-            for dof, angle in zip(self.dofs_per_leg, adjusted_psi):
-                joints_angles[f"joint_{leg}{dof}"] = float(angle)
-
-        action = {"joints": np.array([joints_angles[dof] for dof in self.all_leg_dofs])}
-        return action
-
-
-def load_single_step_data(
-    csv_path,
-    sim_timestep=0.002,
-    leg_mapping=None,
-    dofs_per_leg=None,
-):
-    """Load one walking cycle from CSV and convert to CPG joint-key format."""
-    leg_mapping = LEG_MAPPING if leg_mapping is None else leg_mapping
-    dofs_per_leg = DOFS_PER_LEG if dofs_per_leg is None else dofs_per_leg
-
-    df = pd.read_csv(csv_path)
-    single_steps_data = {"meta": {"timestep": sim_timestep}}
-
-    for original_leg, short_leg in leg_mapping.items():
-        for dof_name in dofs_per_leg:
-            src_col = f"{dof_name}_{original_leg}"
-            dst_key = f"joint_{short_leg}{dof_name}"
-
-            if src_col not in df.columns:
-                raise KeyError(f"Missing column in CPG CSV: {src_col}")
-
-            single_steps_data[dst_key] = df[src_col].to_numpy(dtype=float)
-
-    for key, values in single_steps_data.items():
-        if not key.startswith("joint_"):
-            continue
-        if np.isclose(values[0], values[-1], atol=1e-6):
-            single_steps_data[key] = values[:-1]
-
-    return single_steps_data
-
-
-def build_psi_functions(single_steps_data, legs=None, dofs_per_leg=None):
-    """Create periodic spline ψ(phase) for each leg from one-cycle joint traces."""
-    legs = LEG_ORDER if legs is None else legs
-    dofs_per_leg = DOFS_PER_LEG if dofs_per_leg is None else dofs_per_leg
-
-    sample_key = f"joint_{legs[0]}{dofs_per_leg[0]}"
-    steps = len(single_steps_data[sample_key])
-
-    # For periodic spline, include endpoint and enforce end equals start.
-    phase_grid = np.linspace(0.0, 2.0 * np.pi, steps)
-    psi_funcs = {}
-
-    for leg in legs:
-        joint_angles = np.array(
-            [single_steps_data[f"joint_{leg}{dof}"] for dof in dofs_per_leg],
-            dtype=float,
+        # Average corresponding phases across adjacent recorded cycles to
+        # reduce tracking noise while preserving the FlyBody joint frame.
+        self.template_cycle = cycle_qpos.mean(axis=0)
+        self.neutral_pose = self.template_cycle.mean(axis=0)
+        phase_grid = np.arange(self.config.period_frames) * (
+            2.0 * np.pi / self.config.period_frames
         )
-        joint_angles[:, -1] = joint_angles[:, 0]
-        psi_funcs[leg] = CubicSpline(
-            phase_grid,
-            joint_angles,
-            axis=1,
+        self._phase_grid = phase_grid
+        self._joint_spline = CubicSpline(
+            np.r_[phase_grid, 2.0 * np.pi],
+            np.concatenate((self.template_cycle, self.template_cycle[:1]), axis=0),
+            axis=0,
             bc_type="periodic",
         )
 
-    return psi_funcs
+        self.all_leg_dofs = [
+            f"joint_{leg}{dof}" for leg in self.legs for dof in self.flybody_dofs
+        ]
+        self.flybody_joint_names = [
+            f"{dof}_{LEG_NAMES[leg]}"
+            for leg in self.legs
+            for dof in self.flybody_dofs
+        ]
+        self.random_state = np.random.RandomState(self.config.seed)
+        self.phase = 0.0
+        self.magnitude = 0.0
+        self.speed = 1.0
+        self.turn = 0.0
+        self._runtime_amplitude_scale = 1.0
+        self._runtime_frequency_scale = 1.0
+        self.adhesion = np.zeros(6, dtype=np.float32)
+        self.reset()
 
+    def reset(self):
+        self.phase = (
+            float(self.random_state.uniform(0.0, 2.0 * np.pi))
+            if self.config.randomize_phase
+            else float(self.config.initial_phase % (2.0 * np.pi))
+        )
+        self.magnitude = 0.0
+        self._runtime_amplitude_scale = 1.0
+        self._runtime_frequency_scale = 1.0
+        self.adhesion[:] = 0.0
 
-def build_tripod_phase_biases(legs=None):
-    """Build tripod gait phase bias matrix used in the notebook example."""
-    legs = LEG_ORDER if legs is None else legs
-    phase_biases = np.zeros((len(legs), len(legs)), dtype=float)
+    def set_command(
+        self,
+        speed: float = 1.0,
+        turn: float = 0.0,
+        amplitude_scale: float | None = None,
+        frequency_scale: float | None = None,
+    ):
+        """Set locomotion command and optional runtime CPG parameters.
 
-    for i, leg_i in enumerate(legs):
-        for j, leg_j in enumerate(legs):
-            same_group = (
-                (leg_i in TRIPOD_GROUP_A and leg_j in TRIPOD_GROUP_A)
-                or (leg_i in TRIPOD_GROUP_B and leg_j in TRIPOD_GROUP_B)
-            )
-            phase_biases[i, j] = 0.0 if same_group else np.pi
+        ``amplitude_scale`` and ``frequency_scale`` are intentionally runtime
+        multipliers.  The frozen dataclass configuration remains the baseline
+        gait, while a learned or heuristic readout can modulate the CPG
+        without rebuilding its template.
+        """
+        self.speed = float(np.clip(speed, -1.0, 1.0))
+        self.turn = float(np.clip(turn, -1.0, 1.0))
+        if amplitude_scale is not None:
+            self._runtime_amplitude_scale = float(np.clip(amplitude_scale, 0.1, 2.0))
+        if frequency_scale is not None:
+            self._runtime_frequency_scale = float(np.clip(frequency_scale, 0.1, 3.0))
 
-    return phase_biases
+    def template_pose(self, phase: float, magnitude: float = 1.0):
+        cycle_pose = np.asarray(self._joint_spline(phase % (2.0 * np.pi)))
+        scale = float(magnitude) * self.config.amplitude_scale
+        return self.neutral_pose + scale * (cycle_pose - self.neutral_pose)
 
+    def command_pose(
+        self,
+        phase: float,
+        magnitude: float = 1.0,
+        speed: float = 1.0,
+        turn: float = 0.0,
+    ):
+        """Evaluate the exact position target for a phase and locomotion command."""
+        if speed == 0.0:
+            return self.neutral_pose.copy()
+        effective_turn = np.clip(
+            float(turn) + self.config.straight_turn_trim, -1.0, 1.0
+        )
+        left_gain = np.clip(1.0 + effective_turn, 0.0, 2.0)
+        right_gain = np.clip(1.0 - effective_turn, 0.0, 2.0)
+        gain = np.array([
+            left_gain, right_gain, left_gain, right_gain, left_gain, right_gain
+        ])
+        pose = self.template_pose(phase, magnitude)
+        return (
+            self.neutral_pose
+            + (pose - self.neutral_pose) * abs(speed) * gain[:, None]
+        )
 
-def make_default_cpg_components(csv_path, sim_timestep=0.002, seed=1):
-    """Create notebook-equivalent CPG network/controller and metadata."""
-    legs = LEG_ORDER.copy()
-    dofs_per_leg = DOFS_PER_LEG.copy()
+    def step(self):
+        self.adhesion[:] = 0.0
+        if self.speed == 0.0:
+            return self.neutral_pose.reshape(-1).copy()
 
-    single_steps_data = load_single_step_data(
-        csv_path=csv_path,
-        sim_timestep=sim_timestep,
-        leg_mapping=LEG_MAPPING,
-        dofs_per_leg=dofs_per_leg,
-    )
-    psi_funcs = build_psi_functions(single_steps_data, legs=legs, dofs_per_leg=dofs_per_leg)
+        self.phase = (
+            self.phase
+            + 2.0 * np.pi * self.frequency * self._runtime_frequency_scale
+            * self.speed * self.timestep
+        ) % (2.0 * np.pi)
+        self.magnitude += (
+            self.config.convergence * (1.0 - self.magnitude) * self.timestep
+        )
+        self.magnitude = float(np.clip(self.magnitude, 0.0, 1.0))
 
-    sample_key = f"joint_{legs[0]}{dofs_per_leg[0]}"
-    preprogrammed_steps_length = len(single_steps_data[sample_key])
-    preprogrammed_steps_timestep = float(single_steps_data["meta"]["timestep"])
-    cycle_duration = preprogrammed_steps_length * preprogrammed_steps_timestep
-    base_freq = 1.0 / cycle_duration
-
-    num_legs = len(legs)
-    intrinsic_freqs = np.ones(num_legs, dtype=float) * base_freq
-    intrinsic_amps = np.ones(num_legs, dtype=float)
-    phase_biases = build_tripod_phase_biases(legs=legs)
-    coupling_weights = np.ones((num_legs, num_legs), dtype=float) * 5.0
-    np.fill_diagonal(coupling_weights, 0.0)
-    convergence_coefs = np.ones(num_legs, dtype=float) * 20.0
-
-    init_phases = np.array(
-        [
-            0.0,  # LF
-            np.pi,  # RF
-            np.pi,  # LM
-            0.0,  # RM
-            0.0,  # LH
-            np.pi,  # RH
-        ],
-        dtype=float,
-    )
-    init_magnitudes = np.ones(num_legs, dtype=float)
-
-    cpg_network = CPGNetwork(
-        timestep=preprogrammed_steps_timestep,
-        intrinsic_freqs=intrinsic_freqs,
-        intrinsic_amps=intrinsic_amps,
-        coupling_weights=coupling_weights,
-        phase_biases=phase_biases,
-        convergence_coefs=convergence_coefs,
-        init_phases=init_phases.copy(),
-        init_magnitudes=init_magnitudes.copy(),
-        seed=seed,
-    )
-
-    psi_rest_phases = np.zeros(num_legs, dtype=float)
-    all_leg_dofs = [f"joint_{leg}{dof}" for leg in legs for dof in dofs_per_leg]
-
-    cpg_controller = CPGController(
-        cpg_network=cpg_network,
-        legs=legs,
-        psi_funcs=psi_funcs,
-        psi_rest_phases=psi_rest_phases,
-        dofs_per_leg=dofs_per_leg,
-        all_leg_dofs=all_leg_dofs,
-    )
-
-    return {
-        "cpg_network": cpg_network,
-        "cpg_controller": cpg_controller,
-        "single_steps_data": single_steps_data,
-        "legs": legs,
-        "dofs_per_leg": dofs_per_leg,
-        "all_leg_dofs": all_leg_dofs,
-        "base_freq": base_freq,
-    }
+        pose = self.command_pose(
+            self.phase,
+            magnitude=self.magnitude,
+            speed=self.speed,
+            turn=self.turn,
+        )
+        pose = self.neutral_pose + (
+            pose - self.neutral_pose
+        ) * self._runtime_amplitude_scale
+        return pose.reshape(-1).astype(np.float32)
